@@ -1,0 +1,208 @@
+drop table if exists tmp_aliases_search;
+create temporary table tmp_aliases_search
+distkey(previous_id)
+sortkey(previous_id)
+as
+select * from production.aliases;
+
+drop table if exists tmp_viewed_restaurant_list;
+create temporary table tmp_viewed_restaurant_list
+sortkey(anonymous_id)
+as
+SELECT user_id,
+       anonymous_id,
+       received_at,
+       platform,
+       device_type,
+       context_app_version,
+       roo_browser,
+       roo_browser_version,
+       context_campaign_medium,
+       context_campaign_source,
+       context_campaign_name,
+       tld,
+       zone_code,
+       context_ip,
+       shortest_expected_delivery_time_mins,
+       available_restaurants
+FROM production.viewed_restaurant_list;
+
+
+drop table if exists combined_session_alias_search;
+create temporary table combined_session_alias_search
+distkey(id)
+sortkey(id)
+as
+SELECT COALESCE(e1.user_id,a.user_id,e1.anonymous_id) AS id,
+       e1.user_id,
+       e1.anonymous_id,
+       e1.received_at,
+       e1.platform,
+       e1.device_type,
+       e1.context_app_version,
+       e1.roo_browser,
+       e1.roo_browser_version,
+       e1.context_campaign_medium,
+       e1.context_campaign_source,
+       e1.context_campaign_name,
+       e1.tld,
+       e1.zone_code,
+       e1.context_ip,
+       e1.shortest_expected_delivery_time_mins,
+       e1.available_restaurants
+FROM tmp_viewed_restaurant_list AS e1
+LEFT JOIN tmp_aliases_search AS a
+  ON a.previous_id = e1.anonymous_id;
+
+drop table if exists tmp_completed_order_search;
+create temporary table tmp_completed_order_search
+distkey(id)
+sortkey(id)
+as
+select COALESCE(user_id, anonymous_id) as id,
+received_at
+from production.completed_order;
+
+drop table if exists tmp_first_visit_search;
+create temporary table tmp_first_visit_search
+distkey(id)
+sortkey(id)
+ AS 
+ SELECT 
+   id,
+    MIN(received_at) AS timestamp
+   
+  from combined_session_alias_search
+  GROUP BY id;
+
+-- Main conversion query with parameters
+drop table if exists tmp_conversion_data_search;
+CREATE TEMPORARY TABLE tmp_conversion_data_search
+diststyle even
+AS
+SELECT 
+
+  TO_CHAR(DATE_TRUNC('DAY', e1.received_at), 'YYYY-mm-dd') as date
+  , TO_CHAR(DATE_TRUNC('hour', e1.received_at), 'HH24:MI') as hour
+  , COALESCE(p.name, 'unknown') AS country
+  , COALESCE(c.name, 'unknown') as city
+  , COALESCE(z.code, 'unknown') AS zone
+  , COALESCE(e1.platform, 'unknown') AS platform
+  , COALESCE(e1.device_type, 'unknown') AS device_type
+  , CASE WHEN e1.shortest_expected_delivery_time_mins BETWEEN 0 AND 5-1 THEN '0-4'
+    WHEN e1.shortest_expected_delivery_time_mins  BETWEEN 5 AND 10-1 THEN '5-9'
+    WHEN e1.shortest_expected_delivery_time_mins BETWEEN 10 AND 15-1 THEN '10-14'
+    WHEN e1.shortest_expected_delivery_time_mins BETWEEN 15 AND 20-1 THEN '15-19'
+    WHEN e1.shortest_expected_delivery_time_mins BETWEEN 20 AND 25-1 THEN '20-24'
+    WHEN e1.shortest_expected_delivery_time_mins BETWEEN 25 AND 30-1 THEN '25-29'
+    WHEN e1.shortest_expected_delivery_time_mins BETWEEN 30 AND 35-1 THEN '30-34'
+  WHEN e1.shortest_expected_delivery_time_mins BETWEEN 35 AND 40-1 THEN '35-39'
+  WHEN e1.shortest_expected_delivery_time_mins BETWEEN 40 AND 45-1 THEN '40-44'
+  WHEN e1.shortest_expected_delivery_time_mins BETWEEN 45 AND 50-1 THEN '45-49'
+  WHEN e1.shortest_expected_delivery_time_mins BETWEEN 50 AND 55-1 THEN '50-54'
+  WHEN e1.shortest_expected_delivery_time_mins BETWEEN 55 AND 60-1 THEN '55-59'
+  WHEN e1.shortest_expected_delivery_time_mins BETWEEN 60 AND 65-1 THEN '60-64'
+  WHEN e1.shortest_expected_delivery_time_mins BETWEEN 65 AND 70-1 THEN '65-70'
+  WHEN e1.shortest_expected_delivery_time_mins > 70 THEN '70+' END
+   as shortest_delivery
+--   , e1.shortest_expected_delivery_time_mins as shortest_delivery_raw
+    , sa.additional_delay as service_block
+    , CASE
+         WHEN fv.timestamp IS NULL THEN 'wut'
+         WHEN DATE_TRUNC('DAY',fv.timestamp) = DATE_TRUNC('DAY',e1.received_at) THEN 'new'
+         ELSE 'returning'
+-- If the time_stamp equals the timestamp aganist the event then call it new otherwise it is returning
+
+       END AS new_returning,
+       COUNT(DISTINCT e1.id) AS visitors
+-- for session start, user the first of: user id, aliased id, or anonymous ID as the
+       -- user ID
+       ,
+       COUNT(DISTINCT e2.id) AS converters
+-- coalescing IDs for conversions isn't really necessary, as conversions always have
+       -- a logged-in user
+FROM combined_session_alias_search AS e1
+
+  LEFT JOIN tmp_first_visit_search AS fv 
+    ON fv.id = e1.id
+
+JOIN delivery_zone AS z
+  ON z.code = e1.zone_code
+JOIN city AS c
+  ON c.id = z.city_id
+JOIN country AS p
+  ON p.id = c.country_id
+
+
+LEFT JOIN service_advisory sa
+  ON z.id = sa.zone_id
+  AND e1.received_at >= sa.created_at
+  AND e1.received_at <=sa.completed_at
+
+  LEFT JOIN tmp_completed_order_search AS e2
+         ON e1.id = e2.id
+-- only conversions for the same user (duh)
+
+        AND e2.received_at > e1.received_at
+-- only conversions that happen after the session starts
+
+        AND e2.received_at < e1.received_at +INTERVAL '30 minutes'
+--x.conversion_window
+-- conversions that happen within a reasonable time of the session starting
+
+WHERE TRUE
+AND date(e1.received_at) >= '2016-05-01'  AND date(e1.received_at) <= '2016-06-30'
+AND   e1.context_ip NOT IN 
+  ('80.58.148.49','203.213.66.126','52.71.155.178','212.159.159.114','203.66.159.46','219.255.197.90','199.88.96.248','201.221.132.69','113.53.230.199','62.37.237.16','200.29.191.149','52.19.187.53','52.28.221.96','193.194.69.36','101.255.51.47','62.37.237.15','52.3.105.23','203.162.69.22','202.20.99.196', '163.28.80.40', '92.46.125.177', '86.188.142.244', '78.8.195.131', '5.39.10.71', '43.226.162.107', '43.226.162.110', '5.135.254.35', '185.28.193.95', '109.207.49.158', '178.88.64.83', '217.106.65.253', '94.42.140.10', '80.96.203.117', '81.181.81.26', '95.131.181.170', '201.221.132.69', '61.160.243.172', '52.71.155.178'  )
+  AND e1.shortest_expected_delivery_time_mins IS NOT NULL
+--  AND sa.block_type = 'unblocked'
+
+-- Excludes ip addresses that we have established are bots
+
+GROUP BY 
+  DATE_TRUNC('DAY',e1.received_at),
+  DATE_TRUNC('hour', e1.received_at),
+  p.name,
+  c.name,
+  z.code,
+  e1.platform,
+  e1.device_type,
+  e1.shortest_expected_delivery_time_mins,
+  sa.additional_delay,
+  new_returning;
+
+SELECT
+ -- cd.date
+--  ,cd.hour
+--   cd.city,
+--  cd.shortest_delivery
+--  , cd.available_restaurants
+-- , cd.new_returning
+  ,cd.service_block
+  
+-- This is where the standard deviation magic happens  
+  , SUM(cd.visitors) AS visitors
+  , SUM(cd.converters) AS converters
+  , sum(converters)/sum(visitors)::float as mean
+  , (sum(converters)/sum(visitors)::float)*(1-sum(converters)/sum(visitors)::float) / sum(visitors)::float AS sampling_distribution_variance
+  , POW((sum(converters)/sum(visitors)::float)*(1.000-(sum(converters)/sum(visitors)::float)) / sum(visitors), 0.5) AS sampling_distribution_stddev
+
+FROM tmp_conversion_data_search AS cd
+
+WHERE
+  cd.hour IN ('17:00','18:00','19:00','20:00','21:00')
+--  AND shortest_delivery IS NOT NULL
+--  AND cd.city IN ('London','Paris','Dublin')
+  
+GROUP BY 
+ -- cd.date,
+ -- cd.hour
+  --cd.country, 
+-- cd.city,
+  cd.shortest_delivery
+--  cd.service_block
+  --cd.zone, 
+ -- cd.platform, 
+--  cd.device_type,
+--  cd.available_restaurants
+-- cd.new_returning;
